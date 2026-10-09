@@ -2,6 +2,7 @@ from pathlib import Path
 import subprocess
 import sys
 
+import numpy as np
 import pandas as pd
 import plotly.express as px
 import plotly.graph_objects as go
@@ -41,7 +42,31 @@ def load_data(path, modified_time, file_size):
     if frame.empty:
         raise ValueError("CSV contains no data rows.")
     if "timestamp" in frame.columns:
-        frame["timestamp"] = pd.to_datetime(frame["timestamp"], errors="coerce")
+        raw = frame["timestamp"]
+        numeric = pd.to_numeric(raw, errors="coerce")
+        numeric_ratio = numeric.notna().mean() if len(raw) else 0.0
+
+        # Numeric timestamps may be Unix epochs, or merely row numbers.
+        # Do not let row numbers silently become dates in January 1970.
+        if numeric_ratio > 0.95:
+            values = numeric.dropna()
+            median_abs = float(values.abs().median()) if len(values) else 0.0
+            if median_abs >= 1e17:
+                parsed = pd.to_datetime(numeric, unit="ns", errors="coerce")
+            elif median_abs >= 1e14:
+                parsed = pd.to_datetime(numeric, unit="us", errors="coerce")
+            elif median_abs >= 1e11:
+                parsed = pd.to_datetime(numeric, unit="ms", errors="coerce")
+            elif median_abs >= 1e8:
+                parsed = pd.to_datetime(numeric, unit="s", errors="coerce")
+            else:
+                # These are observation IDs, not trustworthy calendar dates.
+                # Keep them numeric and use an observation-index axis below.
+                parsed = pd.Series(pd.NaT, index=frame.index)
+                frame["timestamp_is_index"] = True
+            frame["timestamp"] = parsed
+        else:
+            frame["timestamp"] = pd.to_datetime(raw, errors="coerce")
     return frame
 
 
@@ -56,91 +81,126 @@ def read_result(name):
         return None
 
 
-def add_event_markers(fig, x_column, detector_frame=None, adaptation_frame=None):
-    """Overlay alarm and adaptation points where event timestamps/indices are available."""
+def _event_x_values(event_frame, x_column, dataset_frame):
+    """Resolve event timestamps or observation indices to the plotted x-axis."""
+    if event_frame is None or event_frame.empty:
+        return []
+
+    candidates = [x_column, "timestamp", "window_start", "adapted_at",
+                  "adaptation_timestamp", "adaptation_point", "observation",
+                  "row_index", "row", "index", "sample_index"]
+    col = next((c for c in candidates if c and c in event_frame.columns), None)
+    if col is None:
+        return []
+
+    values = event_frame[col].dropna()
+    if values.empty:
+        return []
+
+    # If event values are row indices, map them to the dataset's actual x values.
+    numeric = pd.to_numeric(values, errors="coerce")
+    if numeric.notna().mean() > 0.9:
+        idx = numeric.astype(int)
+        if idx.between(0, len(dataset_frame) - 1).all():
+            return dataset_frame.iloc[idx.to_numpy()][x_column].tolist()
+
+    if x_column == "timestamp":
+        parsed = pd.to_datetime(values, errors="coerce")
+        if parsed.notna().any():
+            return parsed.dropna().tolist()
+    return values.tolist()
+
+
+def add_event_markers(fig, x_column, dataset_frame, detector_frame=None, adaptation_frame=None):
+    """Overlay red detector alarms and teal adaptation markers on the correct x-axis."""
     if detector_frame is not None and not detector_frame.empty:
-        xcol = next(
-            (c for c in [x_column, "timestamp", "window_start", "row", "index"]
-             if c in detector_frame.columns),
-            None,
-        )
         alarm_cols = [
-            c for c in ["KS_alarm", "PSI_alarm", "Page_Hinkley_alarm", "alarm", "drift_alarm"]
-            if c in detector_frame.columns
+            c for c in detector_frame.columns
+            if any(k in str(c).lower() for k in ["alarm", "drift_detected"])
         ]
-        if xcol and alarm_cols:
-            alarm_mask = (
-                detector_frame[alarm_cols]
-                .apply(pd.to_numeric, errors="coerce")
-                .fillna(0)
-                .astype(bool)
-                .any(axis=1)
+        if alarm_cols:
+            numeric_flags = detector_frame[alarm_cols].apply(
+                lambda col: col.astype(str).str.lower().isin(
+                    ["1", "true", "yes", "alarm", "drift"]
+                ) | pd.to_numeric(col, errors="coerce").fillna(0).ne(0)
             )
-            for value in detector_frame.loc[alarm_mask, xcol].dropna().tolist():
+            alarm_rows = detector_frame.loc[numeric_flags.any(axis=1)].copy()
+            alarm_values = _event_x_values(alarm_rows, x_column, dataset_frame)
+            for i, value in enumerate(dict.fromkeys(alarm_values)):
                 try:
                     fig.add_vline(
-                        x=value, line_dash="dash", line_width=1,
-                        line_color="#E45756", opacity=0.75,
+                        x=value, line_dash="dash", line_width=1.5,
+                        line_color="#E45756", opacity=0.9,
+                        annotation_text="New drift alarm" if i == 0 else None,
+                        annotation_position="top",
                     )
                 except (TypeError, ValueError):
-                    pass
+                    continue
 
     if adaptation_frame is not None and not adaptation_frame.empty:
-        adapt_col = next(
-            (c for c in ["adapted_at", "adaptation_timestamp", "adaptation_point", x_column]
-             if c in adaptation_frame.columns),
-            None,
-        )
-        if adapt_col:
-            for value in adaptation_frame[adapt_col].dropna().tolist():
-                try:
-                    fig.add_vline(
-                        x=value, line_dash="dot", line_width=2,
-                        line_color="#2A9D8F", opacity=0.9,
-                    )
-                except (TypeError, ValueError):
-                    pass
-
+        adapt_values = _event_x_values(adaptation_frame, x_column, dataset_frame)
+        for i, value in enumerate(dict.fromkeys(adapt_values)):
+            try:
+                fig.add_vline(
+                    x=value, line_dash="dot", line_width=2,
+                    line_color="#2A9D8F", opacity=0.95,
+                    annotation_text="Adaptation" if i == 0 else None,
+                    annotation_position="bottom",
+                )
+            except (TypeError, ValueError):
+                continue
     return fig
 
 
 def align_prediction_timestamps(prediction_frame, dataset_frame):
-    """Use real dataset timestamps when prediction timestamps are indices/numeric."""
+    """Align predictions to real timestamps or to row indices when no real dates exist."""
     pred = prediction_frame.copy()
-    dataset_times = pd.to_datetime(dataset_frame["timestamp"], errors="coerce")
+    row_candidates = ["row", "row_index", "observation", "index", "sample_index"]
+    row_col = next((c for c in row_candidates if c in pred.columns), None)
 
-    if "timestamp" not in pred.columns:
-        row_col = next((c for c in ["row", "row_index", "observation", "index"] if c in pred.columns), None)
-        if row_col is not None:
-            row_ids = pd.to_numeric(pred[row_col], errors="coerce")
-            if row_ids.notna().all() and row_ids.between(0, len(dataset_frame) - 1).all():
-                pred["timestamp"] = dataset_times.iloc[row_ids.astype(int).to_numpy()].to_numpy()
-        elif len(pred) == len(dataset_frame):
-            pred["timestamp"] = dataset_times.to_numpy()
-        else:
-            pred["timestamp"] = pd.NaT
-    else:
-        parsed = pd.to_datetime(pred["timestamp"], errors="coerce")
-        # Numeric values often represent row indices rather than actual datetimes.
-        numeric = pd.to_numeric(pred["timestamp"], errors="coerce")
-        if parsed.isna().mean() > 0.5 or (
-            numeric.notna().mean() > 0.9 and
-            (numeric.dropna().between(0, len(dataset_frame) - 1).mean() > 0.9)
-        ):
-            row_col = next((c for c in ["row", "row_index", "observation", "index"] if c in pred.columns), None)
-            row_ids = pd.to_numeric(pred[row_col], errors="coerce") if row_col else numeric
-            if row_ids.notna().all() and row_ids.between(0, len(dataset_frame) - 1).all():
-                pred["timestamp"] = dataset_times.iloc[row_ids.astype(int).to_numpy()].to_numpy()
+    if dataset_frame["timestamp"].notna().any():
+        dataset_x = pd.to_datetime(dataset_frame["timestamp"], errors="coerce")
+        if "timestamp" not in pred.columns:
+            if row_col:
+                row_ids = pd.to_numeric(pred[row_col], errors="coerce")
+                valid = row_ids.notna() & row_ids.between(0, len(dataset_frame) - 1)
+                pred["timestamp"] = pd.NaT
+                pred.loc[valid, "timestamp"] = dataset_x.iloc[row_ids[valid].astype(int).to_numpy()].to_numpy()
             elif len(pred) == len(dataset_frame):
-                pred["timestamp"] = dataset_times.to_numpy()
+                pred["timestamp"] = dataset_x.to_numpy()
+            else:
+                pred["timestamp"] = pd.NaT
+        else:
+            numeric = pd.to_numeric(pred["timestamp"], errors="coerce")
+            parsed = pd.to_datetime(pred["timestamp"], errors="coerce")
+            looks_like_index = numeric.notna().mean() > 0.9 and numeric.dropna().between(0, len(dataset_frame)-1).mean() > 0.9
+            if parsed.isna().mean() > 0.5 or looks_like_index:
+                ids = pd.to_numeric(pred[row_col], errors="coerce") if row_col else numeric
+                valid = ids.notna() & ids.between(0, len(dataset_frame)-1)
+                pred["timestamp"] = pd.NaT
+                pred.loc[valid, "timestamp"] = dataset_x.iloc[ids[valid].astype(int).to_numpy()].to_numpy()
             else:
                 pred["timestamp"] = parsed
-        else:
-            pred["timestamp"] = parsed
+        pred["timestamp"] = pd.to_datetime(pred["timestamp"], errors="coerce")
+        pred = pred.dropna(subset=["timestamp"]).sort_values("timestamp")
+        return pred
 
-    pred["timestamp"] = pd.to_datetime(pred["timestamp"], errors="coerce")
-    pred = pred.dropna(subset=["timestamp"]).sort_values("timestamp")
-    return pred
+    # Dataset timestamp column was only a row ID. Use observation_index, not 1970.
+    if "observation_index" not in dataset_frame.columns:
+        dataset_frame = dataset_frame.copy()
+        dataset_frame["observation_index"] = np.arange(len(dataset_frame))
+
+    if row_col:
+        ids = pd.to_numeric(pred[row_col], errors="coerce")
+        pred["observation_index"] = ids
+    elif len(pred) == len(dataset_frame):
+        pred["observation_index"] = np.arange(len(pred))
+    elif "timestamp" in pred.columns:
+        pred["observation_index"] = pd.to_numeric(pred["timestamp"], errors="coerce")
+    else:
+        pred["observation_index"] = np.nan
+
+    return pred.dropna(subset=["observation_index"]).sort_values("observation_index")
 
 
 def add_drift_regions(fig, dataset_frame):
@@ -243,6 +303,17 @@ if "timestamp" not in df.columns:
     st.error("Dataset must contain a `timestamp` column.")
     st.stop()
 
+# If timestamp values were only row IDs, use observation index on charts rather
+# than displaying a misleading 1970 calendar axis.
+if df["timestamp"].notna().sum() == 0:
+    df["observation_index"] = np.arange(len(df))
+    X_COL = "observation_index"
+    X_LABEL = "Observation index (timestamp column contains row IDs)"
+else:
+    df = df.dropna(subset=["timestamp"]).sort_values("timestamp").reset_index(drop=True)
+    X_COL = "timestamp"
+    X_LABEL = "Time"
+
 metrics = read_result("strategy_metrics.csv")
 events = read_result("adaptation_events.csv")
 predictions = read_result("predictions.csv")
@@ -274,8 +345,8 @@ with tabs[0]:
     if choices:
         signal = st.selectbox("Signal", choices, key="overview_signal")
         plot_df = df.iloc[::max(1, len(df) // 3000)]
-        fig = px.line(plot_df, x="timestamp", y=signal, title=f"{signal} over time")
-        fig = add_event_markers(fig, "timestamp", detector_metrics, events)
+        fig = px.line(plot_df, x=X_COL, y=signal, title=f"{signal} over time")
+        fig = add_event_markers(fig, X_COL, df, detector_metrics, events)
         st.plotly_chart(fig, width="stretch")
     if metrics is not None:
         view = metrics.copy()
@@ -295,8 +366,8 @@ with tabs[1]:
         sensor = st.selectbox("Sensor / target", choices)
         max_points = st.slider("Maximum plotted points", 500, 10000, 3000, step=500)
         plot_df = df.iloc[::max(1, len(df) // max_points)]
-        fig = px.line(plot_df, x="timestamp", y=sensor, title=f"{sensor} — alarms and adaptation")
-        fig = add_event_markers(fig, "timestamp", detector_metrics, events)
+        fig = px.line(plot_df, x=X_COL, y=sensor, title=f"{sensor} — alarms and adaptation")
+        fig = add_event_markers(fig, X_COL, df, detector_metrics, events)
         st.plotly_chart(fig, width="stretch")
         st.dataframe(df[choices].describe().T, width="stretch")
     else:
@@ -311,8 +382,8 @@ with tabs[2]:
         if choices:
             signal = st.selectbox("Timeline signal", choices, key="timeline_signal")
             plot_df = df.iloc[::max(1, len(df) // 3000)]
-            fig = px.line(plot_df, x="timestamp", y=signal, color="regime", title=f"{signal}: drift, alarms and adaptations")
-            fig = add_event_markers(fig, "timestamp", detector_metrics, events)
+            fig = px.line(plot_df, x=X_COL, y=signal, color="regime", title=f"{signal}: drift, alarms and adaptations")
+            fig = add_event_markers(fig, X_COL, df, detector_metrics, events)
             st.plotly_chart(fig, width="stretch")
         st.caption("Ground-truth regimes are for offline evaluation only; detectors must not use them.")
     else:
@@ -339,7 +410,7 @@ with tabs[3]:
             xcol = "window_start" if "window_start" in detector_metrics.columns else None
             if column in detector_metrics.columns and xcol:
                 fig = px.line(detector_metrics, x=xcol, y=column, title=f"{title}: alarms and adaptations")
-                fig = add_event_markers(fig, xcol, detector_metrics, events)
+                fig = add_event_markers(fig, xcol, df, detector_metrics, events)
                 st.plotly_chart(fig, width="stretch")
 
 with tabs[4]:
@@ -380,40 +451,74 @@ with tabs[5]:
                 max_points = st.slider("Maximum points on chart", 500, 12000, 5000, step=500, key="prediction_points")
                 stride = max(1, len(aligned) // max_points)
                 sample = aligned.iloc[::stride].copy()
+                plot_x_col = "timestamp" if "timestamp" in sample.columns and sample["timestamp"].notna().any() else "observation_index"
                 fig = go.Figure()
                 if actual_col:
                     fig.add_trace(go.Scatter(
-                        x=sample["timestamp"], y=sample[actual_col], mode="lines",
+                        x=sample[plot_x_col], y=sample[actual_col], mode="lines",
                         name="Actual target", line=dict(color="#596273", width=2.6),
                     ))
                 palette = ["#8DA0CB", "#66C2A5", "#4C78A8", "#B279A2", "#F58518", "#54A24B", "#E45756"]
                 for i, col in enumerate(model_cols):
                     fig.add_trace(go.Scatter(
-                        x=sample["timestamp"], y=sample[col], mode="lines", name=str(col),
+                        x=sample[plot_x_col], y=sample[col], mode="lines", name=str(col),
                         line=dict(color=palette[i % len(palette)], width=1.5), opacity=0.9,
                     ))
-                fig = add_drift_regions(fig, df)
-                fig = add_event_markers(fig, "timestamp", detector_metrics, events)
+                # Use a plotting frame whose x-axis matches prediction rows.
+                # This prevents event row IDs from being interpreted as 1970 dates.
+                marker_frame = df.copy()
+                if plot_x_col == "observation_index" and "observation_index" not in marker_frame.columns:
+                    marker_frame["observation_index"] = np.arange(len(marker_frame))
+
+                if plot_x_col == "timestamp":
+                    fig = add_drift_regions(fig, df)
+                fig = add_event_markers(
+                    fig, plot_x_col, marker_frame, detector_metrics, events
+                )
                 fig.update_layout(
                     title="Health deterioration — actual vs all models",
-                    xaxis_title="Time", yaxis_title="Health deterioration",
+                    xaxis_title=("Time" if plot_x_col == "timestamp" else "Observation index"),
+                    yaxis_title="Health deterioration",
                     height=620, autosize=True, hovermode="x unified",
                     legend=dict(orientation="h", yanchor="bottom", y=1.02, xanchor="left", x=0),
                     margin=dict(l=20, r=20, t=90, b=20),
                 )
-                min_time = sample["timestamp"].min()
-                max_time = sample["timestamp"].max()
+                min_time = sample[plot_x_col].min()
+                max_time = sample[plot_x_col].max()
                 if pd.notna(min_time) and pd.notna(max_time):
-                    fig.update_xaxes(range=[min_time, max_time], rangeselector=dict(
-                        buttons=[
+                    axis_options = {"range": [min_time, max_time], "rangeslider": {"visible": True}}
+                    if plot_x_col == "timestamp":
+                        axis_options["rangeselector"] = {"buttons": [
                             dict(count=1, label="1M", step="month", stepmode="backward"),
                             dict(count=3, label="3M", step="month", stepmode="backward"),
                             dict(count=6, label="6M", step="month", stepmode="backward"),
                             dict(step="all", label="All"),
-                        ]
-                    ), rangeslider=dict(visible=True))
+                        ]}
+                    fig.update_xaxes(**axis_options)
                 st.plotly_chart(fig, width="stretch", config={"displaylogo": False, "responsive": True})
-                st.caption("Background shading uses synthetic ground-truth drift labels for offline diagnosis only. Red dashed lines are detector alarms; teal dotted lines are adaptation events when timestamps align.")
+                alarm_columns = (
+                    [c for c in detector_metrics.columns
+                     if any(k in str(c).lower() for k in ["alarm", "drift_detected"])]
+                    if detector_metrics is not None else []
+                )
+                if not alarm_columns:
+                    st.warning(
+                        "No detector alarm columns were found in "
+                        "results/detector_window_metrics.csv. Red alarm lines "
+                        "cannot be verified until experiment.py writes actual alarm flags."
+                    )
+                elif not events is None and events.empty:
+                    st.info("The adaptation event file is empty; no adaptation lines can be shown.")
+                if events is None:
+                    st.warning(
+                        "results/adaptation_events.csv is missing or empty. "
+                        "Teal lines will appear only after the adaptation pipeline records events."
+                    )
+                st.caption(
+                    "Red dashed lines are derived from detector alarm flags in the result CSV; "
+                    "teal dotted lines come from recorded adaptation events. Shaded backgrounds "
+                    "show synthetic ground-truth drift labels for offline evaluation only."
+                )
         st.dataframe(predictions.tail(100), width="stretch", hide_index=True)
 
 with tabs[6]:
