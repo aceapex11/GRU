@@ -41,6 +41,8 @@ def load_data(path, modified_time, file_size):
     frame = pd.read_csv(path)
     if frame.empty:
         raise ValueError("CSV contains no data rows.")
+    if frame.columns.duplicated().any():
+        frame = frame.loc[:, ~frame.columns.duplicated()].copy()
     if "timestamp" in frame.columns:
         raw = frame["timestamp"]
         numeric = pd.to_numeric(raw, errors="coerce")
@@ -82,73 +84,121 @@ def read_result(name):
 
 
 def _event_x_values(event_frame, x_column, dataset_frame):
-    """Resolve event timestamps or observation indices to the plotted x-axis."""
-    if event_frame is None or event_frame.empty:
+    """Safely align event timestamps/indices with the plotted dataset axis."""
+    if (
+        event_frame is None or event_frame.empty
+        or dataset_frame is None or dataset_frame.empty
+        or x_column not in dataset_frame.columns
+    ):
         return []
 
-    candidates = [x_column, "timestamp", "window_start", "adapted_at",
-                  "adaptation_timestamp", "adaptation_point", "observation",
-                  "row_index", "row", "index", "sample_index"]
-    col = next((c for c in candidates if c and c in event_frame.columns), None)
-    if col is None:
+    candidates = [
+        x_column, "timestamp", "window_start", "timestamp_end",
+        "adapted_at", "adaptation_timestamp", "adaptation_point",
+        "observation_index", "observation", "row_index",
+        "sample_index", "row", "index", "window",
+    ]
+    event_col = next((c for c in candidates if c in event_frame.columns), None)
+    if event_col is None:
         return []
 
-    values = event_frame[col].dropna()
+    values = event_frame[event_col].dropna()
     if values.empty:
         return []
-
-    # If event values are row indices, map them to the dataset's actual x values.
-    numeric = pd.to_numeric(values, errors="coerce")
-    if numeric.notna().mean() > 0.9:
-        idx = numeric.astype(int)
-        if idx.between(0, len(dataset_frame) - 1).all():
-            return dataset_frame.iloc[idx.to_numpy()][x_column].tolist()
 
     if x_column == "timestamp":
         parsed = pd.to_datetime(values, errors="coerce")
         if parsed.notna().any():
             return parsed.dropna().tolist()
-    return values.tolist()
+
+    numeric = pd.to_numeric(values, errors="coerce")
+    if numeric.notna().mean() > 0.9:
+        nums = numeric.to_numpy(dtype=float)
+        if (
+            len(nums) and np.isfinite(nums).all()
+            and (nums >= 0).all()
+            and (nums < len(dataset_frame)).all()
+            and np.equal(nums, np.floor(nums)).all()
+        ):
+            return dataset_frame.iloc[nums.astype(int)][x_column].dropna().tolist()
+        return numeric.dropna().tolist()
+
+    if x_column == "timestamp":
+        return pd.to_datetime(values, errors="coerce").dropna().tolist()
+    return []
 
 
-def add_event_markers(fig, x_column, dataset_frame, detector_frame=None, adaptation_frame=None):
-    """Overlay red detector alarms and teal adaptation markers on the correct x-axis."""
+def add_event_markers(
+    fig, x_column, dataset_frame, detector_frame=None,
+    adaptation_frame=None, max_markers=24
+):
+    """Overlay readable, deduplicated detector alarms and adaptation events."""
+    if dataset_frame is None or x_column not in dataset_frame.columns:
+        return fig
+
+    def draw(values, color, dash, label):
+        cleaned, seen = [], set()
+        for value in values:
+            try:
+                if pd.isna(value):
+                    continue
+                key = str(value)
+                if key not in seen:
+                    seen.add(key)
+                    cleaned.append(value)
+            except (TypeError, ValueError):
+                continue
+
+        if not cleaned:
+            return
+
+        total = len(cleaned)
+        if total > max_markers:
+            picks = np.linspace(0, total - 1, max_markers, dtype=int)
+            cleaned = [cleaned[i] for i in picks]
+
+        fig.add_trace(go.Scatter(
+            x=[None], y=[None], mode="lines",
+            name=f"{label} ({total})",
+            line=dict(color=color, dash=dash, width=2),
+            hoverinfo="skip",
+        ))
+        for value in cleaned:
+            try:
+                fig.add_vline(
+                    x=value, line_color=color, line_dash=dash,
+                    line_width=1.3, opacity=0.78
+                )
+            except (TypeError, ValueError, OverflowError):
+                continue
+
     if detector_frame is not None and not detector_frame.empty:
         alarm_cols = [
             c for c in detector_frame.columns
-            if any(k in str(c).lower() for k in ["alarm", "drift_detected"])
+            if any(token in str(c).lower() for token in
+                   ("alarm", "drift_detected", "change_detected"))
         ]
         if alarm_cols:
-            numeric_flags = detector_frame[alarm_cols].apply(
-                lambda col: col.astype(str).str.lower().isin(
-                    ["1", "true", "yes", "alarm", "drift"]
-                ) | pd.to_numeric(col, errors="coerce").fillna(0).ne(0)
-            )
-            alarm_rows = detector_frame.loc[numeric_flags.any(axis=1)].copy()
-            alarm_values = _event_x_values(alarm_rows, x_column, dataset_frame)
-            for i, value in enumerate(dict.fromkeys(alarm_values)):
-                try:
-                    fig.add_vline(
-                        x=value, line_dash="dash", line_width=1.5,
-                        line_color="#E45756", opacity=0.9,
-                        annotation_text="New drift alarm" if i == 0 else None,
-                        annotation_position="top",
+            flags = detector_frame[alarm_cols].apply(
+                lambda col: (
+                    col.astype(str).str.strip().str.lower().isin(
+                        ["1", "true", "yes", "alarm", "drift"]
                     )
-                except (TypeError, ValueError):
-                    continue
+                    | pd.to_numeric(col, errors="coerce").fillna(0).ne(0)
+                )
+            )
+            alarm_rows = detector_frame.loc[flags.any(axis=1)]
+            draw(
+                _event_x_values(alarm_rows, x_column, dataset_frame),
+                "#D97706", "dash", "New drift alarm"
+            )
 
     if adaptation_frame is not None and not adaptation_frame.empty:
-        adapt_values = _event_x_values(adaptation_frame, x_column, dataset_frame)
-        for i, value in enumerate(dict.fromkeys(adapt_values)):
-            try:
-                fig.add_vline(
-                    x=value, line_dash="dot", line_width=2,
-                    line_color="#2A9D8F", opacity=0.95,
-                    annotation_text="Adaptation" if i == 0 else None,
-                    annotation_position="bottom",
-                )
-            except (TypeError, ValueError):
-                continue
+        draw(
+            _event_x_values(adaptation_frame, x_column, dataset_frame),
+            "#0F766E", "dot", "Adaptation"
+        )
+
     return fig
 
 
@@ -347,7 +397,7 @@ with tabs[0]:
         plot_df = df.iloc[::max(1, len(df) // 3000)]
         fig = px.line(plot_df, x=X_COL, y=signal, title=f"{signal} over time")
         fig = add_event_markers(fig, X_COL, df, detector_metrics, events)
-        st.plotly_chart(fig, width="stretch")
+        st.plotly_chart(fig, width="stretch", config={"displaylogo": False, "responsive": True})
     if metrics is not None:
         view = metrics.copy()
         if "Phase" in view.columns:
@@ -368,7 +418,7 @@ with tabs[1]:
         plot_df = df.iloc[::max(1, len(df) // max_points)]
         fig = px.line(plot_df, x=X_COL, y=sensor, title=f"{sensor} — alarms and adaptation")
         fig = add_event_markers(fig, X_COL, df, detector_metrics, events)
-        st.plotly_chart(fig, width="stretch")
+        st.plotly_chart(fig, width="stretch", config={"displaylogo": False, "responsive": True})
         st.dataframe(df[choices].describe().T, width="stretch")
     else:
         st.warning("No recognized sensor columns found.")
@@ -384,7 +434,7 @@ with tabs[2]:
             plot_df = df.iloc[::max(1, len(df) // 3000)]
             fig = px.line(plot_df, x=X_COL, y=signal, color="regime", title=f"{signal}: drift, alarms and adaptations")
             fig = add_event_markers(fig, X_COL, df, detector_metrics, events)
-            st.plotly_chart(fig, width="stretch")
+            st.plotly_chart(fig, width="stretch", config={"displaylogo": False, "responsive": True})
         st.caption("Ground-truth regimes are for offline evaluation only; detectors must not use them.")
     else:
         st.warning("No `regime` column found.")
@@ -410,8 +460,11 @@ with tabs[3]:
             xcol = "window_start" if "window_start" in detector_metrics.columns else None
             if column in detector_metrics.columns and xcol:
                 fig = px.line(detector_metrics, x=xcol, y=column, title=f"{title}: alarms and adaptations")
-                fig = add_event_markers(fig, xcol, df, detector_metrics, events)
-                st.plotly_chart(fig, width="stretch")
+                marker_frame = df.copy()
+                if xcol not in marker_frame.columns:
+                    marker_frame[xcol] = np.arange(len(marker_frame))
+                fig = add_event_markers(fig, xcol, marker_frame, detector_metrics, events)
+                st.plotly_chart(fig, width="stretch", config={"displaylogo": False, "responsive": True})
 
 with tabs[4]:
     if metrics is None:
