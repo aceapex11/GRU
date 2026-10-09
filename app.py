@@ -4,6 +4,7 @@ import sys
 
 import pandas as pd
 import plotly.express as px
+import plotly.graph_objects as go
 import streamlit as st
 from pandas.errors import EmptyDataError, ParserError
 
@@ -103,6 +104,84 @@ def add_event_markers(fig, x_column, detector_frame=None, adaptation_frame=None)
     return fig
 
 
+def align_prediction_timestamps(prediction_frame, dataset_frame):
+    """Use real dataset timestamps when prediction timestamps are indices/numeric."""
+    pred = prediction_frame.copy()
+    dataset_times = pd.to_datetime(dataset_frame["timestamp"], errors="coerce")
+
+    if "timestamp" not in pred.columns:
+        row_col = next((c for c in ["row", "row_index", "observation", "index"] if c in pred.columns), None)
+        if row_col is not None:
+            row_ids = pd.to_numeric(pred[row_col], errors="coerce")
+            if row_ids.notna().all() and row_ids.between(0, len(dataset_frame) - 1).all():
+                pred["timestamp"] = dataset_times.iloc[row_ids.astype(int).to_numpy()].to_numpy()
+        elif len(pred) == len(dataset_frame):
+            pred["timestamp"] = dataset_times.to_numpy()
+        else:
+            pred["timestamp"] = pd.NaT
+    else:
+        parsed = pd.to_datetime(pred["timestamp"], errors="coerce")
+        # Numeric values often represent row indices rather than actual datetimes.
+        numeric = pd.to_numeric(pred["timestamp"], errors="coerce")
+        if parsed.isna().mean() > 0.5 or (
+            numeric.notna().mean() > 0.9 and
+            (numeric.dropna().between(0, len(dataset_frame) - 1).mean() > 0.9)
+        ):
+            row_col = next((c for c in ["row", "row_index", "observation", "index"] if c in pred.columns), None)
+            row_ids = pd.to_numeric(pred[row_col], errors="coerce") if row_col else numeric
+            if row_ids.notna().all() and row_ids.between(0, len(dataset_frame) - 1).all():
+                pred["timestamp"] = dataset_times.iloc[row_ids.astype(int).to_numpy()].to_numpy()
+            elif len(pred) == len(dataset_frame):
+                pred["timestamp"] = dataset_times.to_numpy()
+            else:
+                pred["timestamp"] = parsed
+        else:
+            pred["timestamp"] = parsed
+
+    pred["timestamp"] = pd.to_datetime(pred["timestamp"], errors="coerce")
+    pred = pred.dropna(subset=["timestamp"]).sort_values("timestamp")
+    return pred
+
+
+def add_drift_regions(fig, dataset_frame):
+    """Shade continuous true drift periods as background diagnostic context."""
+    if "timestamp" not in dataset_frame.columns:
+        return fig
+    frame = dataset_frame[["timestamp"]].copy()
+    frame["timestamp"] = pd.to_datetime(frame["timestamp"], errors="coerce")
+    flags = []
+    for col in ["data_drift", "concept_drift"]:
+        if col in dataset_frame.columns:
+            values = dataset_frame[col]
+            if values.dtype == object:
+                active = values.astype(str).str.lower().isin(["true", "1", "yes", "drift"])
+            else:
+                active = pd.to_numeric(values, errors="coerce").fillna(0).ne(0)
+            flags.append((col, active.to_numpy()))
+    if not flags:
+        return fig
+
+    combined = np.zeros(len(frame), dtype=int)
+    for name, active in flags:
+        combined += active.astype(int) * (1 if name == "data_drift" else 2)
+    # Draw contiguous segments; 1=data drift, 2=concept drift, 3=both.
+    valid = frame["timestamp"].notna().to_numpy()
+    values = np.where(valid, combined, 0)
+    starts = np.where(np.r_[True, values[1:] != values[:-1]])[0]
+    ends = np.r_[starts[1:], len(values)]
+    colors = {1: "rgba(245, 166, 35, 0.10)", 2: "rgba(120, 90, 200, 0.10)", 3: "rgba(220, 80, 80, 0.13)"}
+    for start, end in zip(starts, ends):
+        state = int(values[start])
+        if state == 0 or end <= start:
+            continue
+        x0 = frame["timestamp"].iloc[start]
+        x1 = frame["timestamp"].iloc[end - 1]
+        if pd.isna(x0) or pd.isna(x1):
+            continue
+        fig.add_vrect(x0=x0, x1=x1, fillcolor=colors.get(state), line_width=0, layer="below")
+    return fig
+
+
 DATA = resolve_dataset()
 metrics = None
 events = None
@@ -113,7 +192,7 @@ with st.sidebar:
     st.header("Experiment controls")
     st.write(f"Dataset: {DATA.name}" if DATA else "Dataset: not found")
     full = st.checkbox("Full training (slower)", value=False)
-    run = st.button("Run GRU experiment", type="primary", use_container_width=True)
+    run = st.button("Run GRU experiment", type="primary", width="stretch")
     if run:
         if DATA is None:
             st.error("Upload a non-empty industrial_sensor_drift_dataset.csv beside app.py.")
@@ -197,7 +276,7 @@ with tabs[0]:
         plot_df = df.iloc[::max(1, len(df) // 3000)]
         fig = px.line(plot_df, x="timestamp", y=signal, title=f"{signal} over time")
         fig = add_event_markers(fig, "timestamp", detector_metrics, events)
-        st.plotly_chart(fig, use_container_width=True)
+        st.plotly_chart(fig, width="stretch")
     if metrics is not None:
         view = metrics.copy()
         if "Phase" in view.columns:
@@ -206,7 +285,7 @@ with tabs[0]:
                 view = overall
         if "MAE" in view.columns:
             view = view.sort_values("MAE")
-        st.dataframe(view, use_container_width=True, hide_index=True)
+        st.dataframe(view, width="stretch", hide_index=True)
     else:
         st.warning("No GRU results yet. Run the experiment from the sidebar.")
 
@@ -218,8 +297,8 @@ with tabs[1]:
         plot_df = df.iloc[::max(1, len(df) // max_points)]
         fig = px.line(plot_df, x="timestamp", y=sensor, title=f"{sensor} — alarms and adaptation")
         fig = add_event_markers(fig, "timestamp", detector_metrics, events)
-        st.plotly_chart(fig, use_container_width=True)
-        st.dataframe(df[choices].describe().T, use_container_width=True)
+        st.plotly_chart(fig, width="stretch")
+        st.dataframe(df[choices].describe().T, width="stretch")
     else:
         st.warning("No recognized sensor columns found.")
 
@@ -227,14 +306,14 @@ with tabs[2]:
     st.subheader("Designed drift regimes")
     if "regime" in df.columns:
         counts = df.groupby("regime", as_index=False).size()
-        st.plotly_chart(px.bar(counts, x="regime", y="size", title="Rows by regime"), use_container_width=True)
+        st.plotly_chart(px.bar(counts, x="regime", y="size", title="Rows by regime"), width="stretch")
         choices = [c for c in ["temperature_C", "pressure_bar", "vibration_mm_s_rms", "health_deterioration"] if c in df.columns]
         if choices:
             signal = st.selectbox("Timeline signal", choices, key="timeline_signal")
             plot_df = df.iloc[::max(1, len(df) // 3000)]
             fig = px.line(plot_df, x="timestamp", y=signal, color="regime", title=f"{signal}: drift, alarms and adaptations")
             fig = add_event_markers(fig, "timestamp", detector_metrics, events)
-            st.plotly_chart(fig, use_container_width=True)
+            st.plotly_chart(fig, width="stretch")
         st.caption("Ground-truth regimes are for offline evaluation only; detectors must not use them.")
     else:
         st.warning("No `regime` column found.")
@@ -251,17 +330,17 @@ with tabs[3]:
     if detector_metrics is None:
         st.info("Run the experiment to populate detector-window metrics.")
     else:
-        st.dataframe(detector_metrics.tail(500), use_container_width=True, hide_index=True)
+        st.dataframe(detector_metrics.tail(500), width="stretch", hide_index=True)
         alarm_cols = [c for c in ["KS_alarm", "PSI_alarm", "Page_Hinkley_alarm"] if c in detector_metrics.columns]
         if alarm_cols:
             counts = detector_metrics[alarm_cols].apply(pd.to_numeric, errors="coerce").fillna(0).sum().rename_axis("Detector").reset_index(name="Alarm windows")
-            st.plotly_chart(px.bar(counts, x="Detector", y="Alarm windows", title="Alarm windows by detector"), use_container_width=True)
+            st.plotly_chart(px.bar(counts, x="Detector", y="Alarm windows", title="Alarm windows by detector"), width="stretch")
         for column, title in [("max_PSI", "Maximum PSI"), ("max_KS_stat", "Maximum KS statistic")]:
             xcol = "window_start" if "window_start" in detector_metrics.columns else None
             if column in detector_metrics.columns and xcol:
                 fig = px.line(detector_metrics, x=xcol, y=column, title=f"{title}: alarms and adaptations")
                 fig = add_event_markers(fig, xcol, detector_metrics, events)
-                st.plotly_chart(fig, use_container_width=True)
+                st.plotly_chart(fig, width="stretch")
 
 with tabs[4]:
     if metrics is None:
@@ -275,46 +354,84 @@ with tabs[4]:
                 view = view[view["Phase"].astype(str) == phase]
         if "MAE" in view.columns:
             view = view.sort_values("MAE")
-        st.dataframe(view, use_container_width=True, hide_index=True)
+        st.dataframe(view, width="stretch", hide_index=True)
         available = [c for c in ["MAE", "RMSE", "R2"] if c in view.columns]
         if "Strategy" in view.columns and available:
             metric = st.selectbox("Plot metric", available)
-            st.plotly_chart(px.bar(view, x="Strategy", y=metric, title=f"{metric} by strategy", text_auto=".3f"), use_container_width=True)
+            st.plotly_chart(px.bar(view, x="Strategy", y=metric, title=f"{metric} by strategy", text_auto=".3f"), width="stretch")
 
 with tabs[5]:
+    st.subheader("Actual vs predicted — all GRU strategies")
     if predictions is None:
         st.warning("Predictions appear after running the experiment.")
     else:
-        strategies = [c for c in predictions.columns if c not in ["row", "timestamp", "actual"]]
-        if strategies:
-            strategy = st.selectbox("Strategy prediction", strategies)
-            if "timestamp" in predictions.columns:
-                n = min(len(predictions), 6000)
-                sample = predictions.iloc[::max(1, len(predictions) // max(1, n))]
-                columns = [c for c in ["timestamp", "actual", strategy] if c in sample.columns]
-                if len(columns) >= 2:
-                    chart = sample[columns].melt(id_vars="timestamp", var_name="series", value_name="health_deterioration")
-                    fig = px.line(chart, x="timestamp", y="health_deterioration", color="series", title="Actual vs predicted — alarms and adaptations")
-                    fig = add_event_markers(fig, "timestamp", detector_metrics, events)
-                    st.plotly_chart(fig, use_container_width=True)
-        st.dataframe(predictions.tail(100), use_container_width=True, hide_index=True)
+        aligned = align_prediction_timestamps(predictions, df)
+        if aligned.empty:
+            st.error("Could not align prediction rows to valid dataset timestamps. Check predictions.csv row/index columns.")
+        else:
+            actual_col = next((c for c in ["actual", "actual_target", "y_true", "target_actual"] if c in aligned.columns), None)
+            metadata = {"timestamp", "row", "row_index", "observation", "index", "actual", "actual_target", "y_true", "target_actual"}
+            model_cols = [c for c in aligned.columns if c not in metadata and pd.api.types.is_numeric_dtype(aligned[c])]
+            if actual_col is None:
+                st.warning("No actual-target column was found in predictions.csv. Showing available model prediction columns only.")
+            if not model_cols and actual_col is None:
+                st.info("No numeric prediction columns are available.")
+            else:
+                max_points = st.slider("Maximum points on chart", 500, 12000, 5000, step=500, key="prediction_points")
+                stride = max(1, len(aligned) // max_points)
+                sample = aligned.iloc[::stride].copy()
+                fig = go.Figure()
+                if actual_col:
+                    fig.add_trace(go.Scatter(
+                        x=sample["timestamp"], y=sample[actual_col], mode="lines",
+                        name="Actual target", line=dict(color="#596273", width=2.6),
+                    ))
+                palette = ["#8DA0CB", "#66C2A5", "#4C78A8", "#B279A2", "#F58518", "#54A24B", "#E45756"]
+                for i, col in enumerate(model_cols):
+                    fig.add_trace(go.Scatter(
+                        x=sample["timestamp"], y=sample[col], mode="lines", name=str(col),
+                        line=dict(color=palette[i % len(palette)], width=1.5), opacity=0.9,
+                    ))
+                fig = add_drift_regions(fig, df)
+                fig = add_event_markers(fig, "timestamp", detector_metrics, events)
+                fig.update_layout(
+                    title="Health deterioration — actual vs all models",
+                    xaxis_title="Time", yaxis_title="Health deterioration",
+                    height=620, autosize=True, hovermode="x unified",
+                    legend=dict(orientation="h", yanchor="bottom", y=1.02, xanchor="left", x=0),
+                    margin=dict(l=20, r=20, t=90, b=20),
+                )
+                min_time = sample["timestamp"].min()
+                max_time = sample["timestamp"].max()
+                if pd.notna(min_time) and pd.notna(max_time):
+                    fig.update_xaxes(range=[min_time, max_time], rangeselector=dict(
+                        buttons=[
+                            dict(count=1, label="1M", step="month", stepmode="backward"),
+                            dict(count=3, label="3M", step="month", stepmode="backward"),
+                            dict(count=6, label="6M", step="month", stepmode="backward"),
+                            dict(step="all", label="All"),
+                        ]
+                    ), rangeslider=dict(visible=True))
+                st.plotly_chart(fig, width="stretch", config={"displaylogo": False, "responsive": True})
+                st.caption("Background shading uses synthetic ground-truth drift labels for offline diagnosis only. Red dashed lines are detector alarms; teal dotted lines are adaptation events when timestamps align.")
+        st.dataframe(predictions.tail(100), width="stretch", hide_index=True)
 
 with tabs[6]:
     if events is None:
         st.info("No adaptation events recorded yet; no alarms may have fired.")
     else:
-        st.dataframe(events, use_container_width=True, hide_index=True)
+        st.dataframe(events, width="stretch", hide_index=True)
         if "adapted_at" in events.columns and "n_samples" in events.columns:
-            st.plotly_chart(px.scatter(events, x="adapted_at", y="n_samples", title="Adaptation time and samples used"), use_container_width=True)
+            st.plotly_chart(px.scatter(events, x="adapted_at", y="n_samples", title="Adaptation time and samples used"), width="stretch")
 
 with tabs[7]:
     st.subheader("Dataset preview")
     st.caption(f"Loaded {DATA.name} ({DATA.stat().st_size:,} bytes).")
-    st.dataframe(df.head(30), use_container_width=True, hide_index=True)
+    st.dataframe(df.head(30), width="stretch", hide_index=True)
     missing = df.isna().sum().rename("missing_count").to_frame()
     missing["missing_pct"] = (missing["missing_count"] / len(df) * 100).round(3)
     st.subheader("Missing values")
-    st.dataframe(missing, use_container_width=True)
+    st.dataframe(missing, width="stretch")
     st.subheader("Scientific cautions")
     st.markdown(
         "- Dataset is synthetic, not field-collected telemetry.\n"
