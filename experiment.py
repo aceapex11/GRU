@@ -6,7 +6,7 @@ import torch
 import torch.nn as nn
 from sklearn.preprocessing import StandardScaler
 from sklearn.metrics import mean_absolute_error, mean_squared_error, r2_score
-from src.detectors import PageHinkley, ks_detector, psi_detector
+from detectors import PageHinkley, ks_detector, psi_detector
 
 # Avoid severe CPU oversubscription in Colab and small VMs.
 torch.set_num_threads(max(1, min(4, os.cpu_count() or 1)))
@@ -82,7 +82,7 @@ def score(y, p):
     return {"MAE":float(mean_absolute_error(y,p)), "RMSE":float(mean_squared_error(y,p)**.5),
             "R2":float(r2_score(y,p)) if len(y)>1 else float("nan")}
 
-def run_experiment(data_path="data/industrial_sensor_drift_dataset.csv", out_dir="results",
+def run_experiment(data_path="industrial_sensor_drift_dataset.csv", out_dir="results",
                    fast=True, seed=SEED):
     set_seed(seed)
     device="cuda" if torch.cuda.is_available() else "cpu"
@@ -208,7 +208,7 @@ def run_experiment(data_path="data/industrial_sensor_drift_dataset.csv", out_dir
 
 if __name__=="__main__":
     ap=argparse.ArgumentParser()
-    ap.add_argument("--data",default="data/industrial_sensor_drift_dataset.csv")
+    ap.add_argument("--data",default="industrial_sensor_drift_dataset.csv")
     ap.add_argument("--out",default="results")
     ap.add_argument("--full",action="store_true",help="Use longer training settings; default is fast smoke-test mode.")
     ap.add_argument("--seed",type=int,default=SEED)
