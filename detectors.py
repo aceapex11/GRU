@@ -1,11 +1,16 @@
 
-"""Unsupervised drift detectors for the PyTorch GRU experiment."""
+"""Drift detectors for the PyTorch GRU streaming experiment."""
 
 import numpy as np
 from scipy.stats import ks_2samp
 
 
-def _prepare_windows(reference, current):
+# Conservative defaults; validate these against offline drift labels.
+KS_P_THRESHOLD = 0.001
+PSI_THRESHOLD = 0.25
+
+
+def _prepare(reference, current):
     reference = np.asarray(reference, dtype=float)
     current = np.asarray(current, dtype=float)
 
@@ -16,61 +21,66 @@ def _prepare_windows(reference, current):
 
     if reference.ndim != 2 or current.ndim != 2:
         return None, None
+
     if reference.shape[1] != current.shape[1]:
         return None, None
 
+    # Drop invalid rows consistently.
     reference = reference[np.isfinite(reference).all(axis=1)]
     current = current[np.isfinite(current).all(axis=1)]
+
     return reference, current
 
 
 def ks_detector(
     reference,
     current,
-    p_threshold=0.001,
+    p_threshold=KS_P_THRESHOLD,
     min_reference=50,
     min_current=20,
-    correction="bonferroni",
 ):
-    """Compare feature distributions using the two-sample KS test."""
-    reference, current = _prepare_windows(reference, current)
+    """Return per-feature KS statistics and a distribution-change alarm."""
+    reference, current = _prepare(reference, current)
 
-    if reference is None:
+    if reference is None or current is None:
         return False, []
+
     if (
         len(reference) < min_reference
         or len(current) < min_current
-        or reference.shape[1] == 0
     ):
         return False, []
 
     details = []
-    n_features = reference.shape[1]
+    feature_count = reference.shape[1]
 
-    for j in range(n_features):
-        ref = reference[:, j]
-        cur = current[:, j]
+    # Bonferroni correction controls false positives across features.
+    adjusted_threshold = p_threshold / max(feature_count, 1)
 
+    for j in range(feature_count):
         statistic, p_value = ks_2samp(
-            ref, cur, alternative="two-sided", method="auto"
+            reference[:, j],
+            current[:, j],
+            alternative="two-sided",
+            method="auto",
         )
+
         details.append({
             "feature_index": j,
             "statistic": float(statistic),
             "p_value": float(p_value),
         })
 
-    threshold = (
-        p_threshold / n_features
-        if correction == "bonferroni"
-        else p_threshold
+    alarm = any(
+        item["p_value"] < adjusted_threshold
+        for item in details
     )
-    alarm = any(item["p_value"] < threshold for item in details)
+
     return bool(alarm), details
 
 
 def _psi_one(reference, current, bins=10, eps=1e-6):
-    """Calculate PSI with bins defined by the reference distribution."""
+    """Calculate PSI using bins determined by the reference data."""
     reference = np.asarray(reference, dtype=float)
     current = np.asarray(current, dtype=float)
 
@@ -84,79 +94,101 @@ def _psi_one(reference, current, bins=10, eps=1e-6):
         np.quantile(reference, np.linspace(0, 1, bins + 1))
     )
 
+    # Constant or nearly constant reference feature.
     if len(edges) < 3:
-        scale = max(abs(float(reference[0])), 1.0)
-        return float(
-            np.mean(
-                np.abs(current - reference[0]) > 1e-8 * scale
-            )
+        scale = max(float(np.max(np.abs(reference))), 1.0)
+        changed_fraction = np.mean(
+            np.abs(current - reference[0]) > 1e-8 * scale
         )
+        return float(changed_fraction)
 
-    edges[0], edges[-1] = -np.inf, np.inf
+    edges[0] = -np.inf
+    edges[-1] = np.inf
 
-    r = np.histogram(reference, bins=edges)[0].astype(float)
-    c = np.histogram(current, bins=edges)[0].astype(float)
+    reference_counts = np.histogram(reference, bins=edges)[0]
+    current_counts = np.histogram(current, bins=edges)[0]
 
-    rp = np.clip(r / max(r.sum(), 1.0), eps, None)
-    cp = np.clip(c / max(c.sum(), 1.0), eps, None)
-    rp /= rp.sum()
-    cp /= cp.sum()
+    reference_pct = (
+        reference_counts.astype(float) / len(reference) + eps
+    )
+    current_pct = (
+        current_counts.astype(float) / len(current) + eps
+    )
 
-    return float(np.sum((cp - rp) * np.log(cp / rp)))
+    reference_pct /= reference_pct.sum()
+    current_pct /= current_pct.sum()
+
+    return float(
+        np.sum(
+            (current_pct - reference_pct)
+            * np.log(current_pct / reference_pct)
+        )
+    )
 
 
 def psi_detector(
     reference,
     current,
-    threshold=0.25,
+    threshold=PSI_THRESHOLD,
     bins=10,
     min_reference=50,
     min_current=20,
 ):
-    """Compare feature distributions using PSI."""
-    reference, current = _prepare_windows(reference, current)
+    """Return per-feature PSI scores and a distribution-change alarm."""
+    reference, current = _prepare(reference, current)
 
-    if reference is None:
+    if reference is None or current is None:
         return False, []
+
     if (
         len(reference) < min_reference
         or len(current) < min_current
-        or reference.shape[1] == 0
     ):
         return False, []
 
     details = []
+
     for j in range(reference.shape[1]):
         value = _psi_one(
-            reference[:, j], current[:, j], bins=bins
+            reference[:, j],
+            current[:, j],
+            bins=bins,
         )
+
         details.append({
             "feature_index": j,
             "psi": float(value),
         })
 
-    return bool(any(item["psi"] >= threshold for item in details)), details
+    return (
+        bool(any(item["psi"] >= threshold for item in details)),
+        details,
+    )
 
 
 class PageHinkley:
-    """Page-Hinkley detector for an increasing monitored scalar signal."""
+    """Page-Hinkley detector for increases in a monitored signal."""
 
     def __init__(
         self,
         delta=0.15,
         threshold=25.0,
         warmup=40,
-        cooldown=20,
+        alpha=1.0,
     ):
-        if delta < 0 or threshold <= 0:
-            raise ValueError("delta must be non-negative and threshold positive.")
-        if warmup < 2 or cooldown < 0:
-            raise ValueError("Invalid warmup or cooldown.")
+        if delta < 0:
+            raise ValueError("delta must be non-negative.")
+        if threshold <= 0:
+            raise ValueError("threshold must be positive.")
+        if warmup < 1:
+            raise ValueError("warmup must be at least 1.")
+        if not 0 < alpha <= 1:
+            raise ValueError("alpha must be in (0, 1].")
 
         self.delta = float(delta)
         self.threshold = float(threshold)
         self.warmup = int(warmup)
-        self.cooldown = int(cooldown)
+        self.alpha = float(alpha)
         self.reset()
 
     def reset(self):
@@ -165,10 +197,9 @@ class PageHinkley:
         self.cum = 0.0
         self.cum_min = 0.0
         self.change_est = None
-        self.last_alarm_t = None
-        self.cooldown_remaining = 0
 
-    def update(self, value, t):
+    def update(self, value, t=None):
+        """Consume one observation and return True when an alarm fires."""
         try:
             value = float(value)
         except (TypeError, ValueError):
@@ -184,19 +215,16 @@ class PageHinkley:
         if self.n <= self.warmup:
             return False
 
-        if self.cooldown_remaining > 0:
-            self.cooldown_remaining -= 1
-            return False
+        self.cum = (
+            self.alpha * self.cum
+            + value - previous_mean - self.delta
+        )
 
-        self.cum += value - previous_mean - self.delta
-        self.cum_min = min(self.cum_min, self.cum)
+        if self.cum < self.cum_min:
+            self.cum_min = self.cum
 
         if self.cum - self.cum_min > self.threshold:
             self.change_est = t
-            self.last_alarm_t = t
-            self.cum = 0.0
-            self.cum_min = 0.0
-            self.cooldown_remaining = self.cooldown
             return True
 
         return False
