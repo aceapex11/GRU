@@ -5,7 +5,7 @@ import streamlit as st
 import plotly.express as px
 
 ROOT = Path(__file__).resolve().parent
-DATA = ROOT / "data" / "industrial_sensor_drift_dataset.csv"
+DATA = ROOT / "industrial_sensor_drift_dataset.csv"
 RESULTS = ROOT / "results"
 
 st.set_page_config(page_title="GRU Drift Intelligence", page_icon="📈", layout="wide")
@@ -32,7 +32,7 @@ with st.sidebar:
     run = st.button("Run GRU experiment", type="primary", use_container_width=True)
     if run:
         with st.spinner("Running the GRU experiment…"):
-            cmd = [sys.executable, "-m", "src.experiment"] + (["--full"] if full else [])
+            cmd = [sys.executable, str(ROOT / "experiment.py"), "--data", str(DATA), "--out", str(RESULTS)] + (["--full"] if full else [])
             proc = subprocess.run(cmd, cwd=ROOT, capture_output=True, text=True, timeout=7200)
         if proc.returncode == 0:
             st.success("Experiment finished. Results refreshed.")
@@ -43,7 +43,7 @@ with st.sidebar:
         st.cache_data.clear()
 
 if not DATA.exists():
-    st.error(f"Dataset not found: {DATA}. Run `python -m src.data_generator` from the repository root.")
+    st.error(f"Dataset not found: {DATA}. Upload `industrial_sensor_drift_dataset.csv` beside `app.py`.")
     st.stop()
 df = load_data(str(DATA), DATA.stat().st_mtime)
 metrics = read_result("strategy_metrics.csv")
